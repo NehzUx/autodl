@@ -1,12 +1,12 @@
 ################################################################################
 # Name:         Ingestion Program
 # Author:       Zhengying Liu, Isabelle Guyon, Adrien Pavao, Zhen Xu
-# Update time:  5 May 2019
+# Update time:  13 Aug 2019
 # Usage: python ingestion.py --dataset_dir=<dataset_dir> --output_dir=<prediction_dir> --ingestion_program_dir=<ingestion_program_dir> --code_dir=<code_dir> --score_dir=<score_dir>
 
 # AS A PARTICIPANT, DO NOT MODIFY THIS CODE.
 
-VERSION = 'v20190505'
+VERSION = 'v20191204'
 DESCRIPTION =\
 """This is the "ingestion program" written by the organizers. It takes the
 code written by participants (with `model.py`) and one dataset as input,
@@ -14,6 +14,15 @@ run the code on the dataset and produce predictions on test set. For more
 information on the code/directory structure, please see comments in this
 code (ingestion.py) and the README file of the starting kit.
 Previous updates:
+20191204: [ZY] Add timer and separate model initialization from train/predict
+               process, : now model initilization doesn't consume time budget
+               quota (but can only use 20min)
+20190820: [ZY] Mark the beginning of ingestion right before model.py to reduce
+               variance
+20190708: [ZY] Integrate Julien's parallel data loader
+20190516: [ZY] Change time budget to 20 minutes.
+20190508: [ZY] Add time_budget to 'start.txt'
+20190507: [ZY] Write timestamps to 'start.txt'
 20190505: [ZY] Use argparse to parse directories AND time budget;
                Rename input_dir to dataset_dir;
                Rename submission_dir to code_dir;
@@ -42,7 +51,8 @@ Previous updates:
 #       └── sample-adult-train.tfrecord
 #
 # The output directory output_dir (e.g. AutoDL_sample_result_submission/)
-# will receive all predictions made during the whole train/predict process
+# will first have a start.txt file written by ingestion then receive
+# all predictions made during the whole train/predict process
 # (thus this directory is updated when a new prediction is made):
 # 	adult.predict_0
 # 	adult.predict_1
@@ -88,6 +98,7 @@ Previous updates:
 verbosity_level = 'INFO'
 
 # Some common useful packages
+from contextlib import contextmanager
 from os import getcwd as pwd
 from os.path import join
 from sys import argv, path
@@ -95,9 +106,11 @@ import argparse
 import datetime
 import glob
 import logging
+import math
 import numpy as np
 import os
 import sys
+import signal
 import time
 
 def get_logger(verbosity_level, use_error_log=False):
@@ -128,17 +141,39 @@ def _HERE(*args):
   h = os.path.dirname(os.path.realpath(__file__))
   return os.path.abspath(os.path.join(h, *args))
 
-def write_start_file(output_dir, start_time):
+def write_start_file(output_dir, start_time=None, time_budget=None,
+                     task_name=None):
   """Create start file 'start.txt' in `output_dir` with ingestion's pid and
   start time.
+
+  The content of this file will be similar to:
+      ingestion_pid: 1
+      task_name: beatriz
+      time_budget: 7200
+      start_time: 1557923830.3012087
+      0: 1557923854.504741
+      1: 1557923860.091236
+      2: 1557923865.9630117
+      3: 1557923872.3627956
+      <more timestamps of predictions>
   """
   ingestion_pid = os.getpid()
   start_filename =  'start.txt'
   start_filepath = os.path.join(output_dir, start_filename)
   with open(start_filepath, 'w') as f:
-    f.write('ingestion_pid: ' + str(ingestion_pid) + '\n')
-    f.write('start_time: ' + str(start_time) + '\n')
+    f.write('ingestion_pid: {}\n'.format(ingestion_pid))
+    f.write('task_name: {}\n'.format(task_name))
+    f.write('time_budget: {}\n'.format(time_budget))
+    f.write('start_time: {}\n'.format(start_time))
   logger.debug("Finished writing 'start.txt' file.")
+
+def write_timestamp(output_dir, predict_idx, timestamp):
+  start_filename =  'start.txt'
+  start_filepath = os.path.join(output_dir, start_filename)
+  with open(start_filepath, 'a') as f:
+    f.write('{}: {}\n'.format(predict_idx, timestamp))
+  logger.debug("Wrote timestamp {} to 'start.txt' for predition {}."\
+               .format(timestamp, predict_idx))
 
 class ModelApiError(Exception):
   pass
@@ -146,13 +181,47 @@ class ModelApiError(Exception):
 class BadPredictionShapeError(Exception):
   pass
 
+class TimeoutException(Exception):
+  pass
+
+class Timer:
+  def __init__(self):
+    self.duration = 0
+    self.total = None
+    self.remain = None
+    self.exec = None
+
+  def set(self, time_budget):
+    self.total = time_budget
+    self.remain = time_budget
+    self.exec = 0
+
+  @contextmanager
+  def time_limit(self, pname):
+    def signal_handler(signum, frame):
+      raise TimeoutException("Timed out!")
+    signal.signal(signal.SIGALRM, signal_handler)
+    signal.alarm(int(math.ceil(self.remain)))
+    start_time = time.time()
+
+    try:
+      yield
+    finally:
+      exec_time = time.time() - start_time
+      signal.alarm(0)
+      self.exec += exec_time
+      self.duration += exec_time
+      self.remain = self.total - self.exec
+
+      logger.info("{} success, time spent so far {} sec"\
+                  .format(pname, self.exec))
+
+      if self.remain <= 0:
+        raise TimeoutException("Timed out for the process: {}!".format(pname))
+
 # =========================== BEGIN PROGRAM ================================
 
 if __name__=="__main__":
-    # Mark starting time of ingestion
-    start = time.time()
-    logger.info("="*5 + " Start ingestion program. " +
-                "Version: {} ".format(VERSION) + "="*5)
 
     #### Check whether everything went well
     ingestion_success = True
@@ -164,7 +233,7 @@ if __name__=="__main__":
     default_ingestion_program_dir = join(root_dir, "AutoDL_ingestion_program")
     default_code_dir = join(root_dir, "AutoDL_sample_code_submission")
     default_score_dir = join(root_dir, "AutoDL_scoring_output")
-    default_time_budget = 7200
+    default_time_budget = 1200
     parser = argparse.ArgumentParser()
     parser.add_argument('--dataset_dir', type=str,
                         default=default_dataset_dir,
@@ -235,13 +304,11 @@ if __name__=="__main__":
     datanames = [x for x in datanames if x.endswith('.data')]
 
     if len(datanames) != 1:
-      raise ValueError("Multiple (or zero) datasets found in dataset_dir={}!\n"\
-                       .format(dataset_dir) +
+      raise ValueError("{} datasets found in dataset_dir={}!\n"\
+                       .format(len(datanames), dataset_dir) +
                        "Please put only ONE dataset under dataset_dir.")
 
     basename = datanames[0]
-
-    write_start_file(output_dir, start_time=start)
 
     logger.info("************************************************")
     logger.info("******** Processing dataset " + basename[:-5].capitalize() +
@@ -260,14 +327,32 @@ if __name__=="__main__":
     output_dim = D_test.get_metadata().get_output_size()
     correct_prediction_shape = (num_examples_test, output_dim)
 
+    # 20 min for participants to initializing and install other packages
     try:
-      # ========= Creating a model
-      from model import Model # in participants' model.py
-      ##### Begin creating model #####
-      logger.info("Creating model...")
-      M = Model(D_train.get_metadata()) # The metadata of D_train and D_test only differ in sample_count
-      ###### End creating model ######
+      init_time_budget = 20 * 60 # time budget for initilization.
+      timer = Timer()
+      timer.set(init_time_budget)
+      with timer.time_limit("Initialization"):
+        ##### Begin creating model #####
+        logger.info("Creating model...this process should not exceed 20min.")
+        from model import Model # in participants' model.py
+        M = Model(D_train.get_metadata()) # The metadata of D_train and D_test only differ in sample_count
+        ###### End creating model ######
+    except TimeoutException as e:
+      logger.info("[-] Initialization phase exceeded time budget. Move to train/predict phase")
+    except Exception as e:
+      logger.error("Failed to initializing model.")
+      logger.error("Encountered exception:\n" + str(e), exc_info=True)
 
+    # Mark starting time of ingestion
+    start = time.time()
+    logger.info("="*5 + " Start core part of ingestion program. " +
+                "Version: {} ".format(VERSION) + "="*5)
+
+    write_start_file(output_dir, start_time=start, time_budget=time_budget,
+                     task_name=basename.split('.')[0])
+
+    try:
       # Check if the model has methods `train` and `test`.
       for attr in ['train', 'test']:
         if not hasattr(M, attr):
@@ -313,6 +398,9 @@ if __name__=="__main__":
               "Bad prediction shape! Expected {} but got {}."\
               .format(correct_prediction_shape, prediction_shape)
             )
+        # Write timestamp to 'start.txt'
+        write_timestamp(output_dir, predict_idx=prediction_order_number,
+                        timestamp=time.time())
         # Prediction files: adult.predict_0, adult.predict_1, ...
         filename_test = basename[:-5] + '.predict_' +\
           str(prediction_order_number)
@@ -335,13 +423,13 @@ if __name__=="__main__":
     overall_time_spent = end_time - start
 
     # Write overall_time_spent to a end.txt file
-    duration_filename =  'end.txt'
-    with open(os.path.join(output_dir, duration_filename), 'w') as f:
+    end_filename =  'end.txt'
+    with open(os.path.join(output_dir, end_filename), 'w') as f:
       f.write('ingestion_duration: ' + str(overall_time_spent) + '\n')
       f.write('ingestion_success: ' + str(int(ingestion_success)) + '\n')
       f.write('end_time: ' + str(end_time) + '\n')
       logger.info("Wrote the file {} marking the end of ingestion."\
-                  .format(duration_filename))
+                  .format(end_filename))
       if ingestion_success:
           logger.info("[+] Done. Ingestion program successfully terminated.")
           logger.info("[+] Overall time spent %5.2f sec " % overall_time_spent)

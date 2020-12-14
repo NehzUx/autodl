@@ -243,7 +243,7 @@ class Model(object):
   # Model functions that contain info on neural network architectures
   # Several model functions are to be implemented, for different domains
   def model_fn(self, features, labels, mode):
-    """Auto-Scaling 3D CNN model.
+    """Linear model (with no hidden layer).
 
     For more information on how to write a model function, see:
       https://www.tensorflow.org/guide/custom_estimators#write_a_model_function
@@ -460,7 +460,7 @@ def crop_time_axis(tensor_4d, num_frames, begin_index=None):
     A Tensor of sequence length `num_frames`, which is a chunk of `tensor_4d`.
   """
   # pad sequence if not long enough
-  pad_size = tf.maximum(num_frames - tf.shape(tensor_4d)[1], 0)
+  pad_size = tf.maximum(num_frames - tf.shape(tensor_4d)[0], 0)
   padded_tensor = tf.pad(tensor_4d, ((0, pad_size), (0, 0), (0, 0), (0, 0)))
 
   # If not given, randomly choose the beginning index of frames
